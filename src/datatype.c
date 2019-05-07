@@ -47,6 +47,7 @@ JL_DLLEXPORT jl_methtable_t *jl_new_method_table(jl_sym_t *name, jl_module_t *mo
     mt->kwsorter = NULL;
     mt->backedges = NULL;
     JL_MUTEX_INIT(&mt->writelock);
+    mt->offs = 1;
     return mt;
 }
 
@@ -201,7 +202,7 @@ unsigned jl_special_vector_alignment(size_t nfields, jl_value_t *t)
     if (mask)
         return 0;               // nfields has more than two 1s
     assert(jl_datatype_nfields(t)==1);
-    jl_value_t *ty = jl_field_type(t, 0);
+    jl_value_t *ty = jl_field_type((jl_datatype_t*)t, 0);
     if (!jl_is_primitivetype(ty))
         // LLVM requires that a vector element be a primitive type.
         // LLVM allows pointer types as vector elements, but until a
@@ -300,9 +301,9 @@ void jl_compute_field_offsets(jl_datatype_t *st)
         // based on whether its definition is self-referential
         if (w->types != NULL) {
             st->isbitstype = st->isconcretetype && !st->mutabl;
-            size_t i, nf = jl_field_count(st);
+            size_t i, nf = jl_svec_len(st->types);
             for (i = 0; i < nf; i++) {
-                jl_value_t *fld = jl_field_type(st, i);
+                jl_value_t *fld = jl_svecref(st->types, i);
                 if (st->isbitstype)
                     st->isbitstype = jl_is_datatype(fld) && ((jl_datatype_t*)fld)->isbitstype;
                 if (!st->zeroinit)
@@ -310,9 +311,9 @@ void jl_compute_field_offsets(jl_datatype_t *st)
             }
             if (st->isbitstype) {
                 st->isinlinealloc = 1;
-                size_t i, nf = jl_field_count(w);
+                size_t i, nf = jl_svec_len(w->types);
                 for (i = 0; i < nf; i++) {
-                    jl_value_t *fld = jl_field_type(w, i);
+                    jl_value_t *fld = jl_svecref(w->types, i);
                     if (references_name(fld, w->name)) {
                         st->isinlinealloc = 0;
                         st->isbitstype = 0;
@@ -480,6 +481,8 @@ JL_DLLEXPORT jl_datatype_t *jl_new_datatype(
             if (!abstract) {
                 tn->mt = jl_new_method_table(name, module);
                 jl_gc_wb(tn, tn->mt);
+                if (jl_svec_len(parameters) > 0)
+                    tn->mt->offs = 0;
             }
         }
         t->name = tn;
@@ -845,31 +848,32 @@ JL_DLLEXPORT jl_value_t *jl_new_structt(jl_datatype_t *type, jl_value_t *tup)
     jl_ptls_t ptls = jl_get_ptls_states();
     if (!jl_is_tuple(tup))
         jl_type_error("new", (jl_value_t*)jl_tuple_type, tup);
-    size_t na = jl_nfields(tup);
+    size_t nargs = jl_nfields(tup);
     size_t nf = jl_datatype_nfields(type);
-    if (na > nf)
-        jl_too_many_args("new", nf);
+    JL_NARGS(new, nf, nf);
     if (type->instance != NULL) {
-        for (size_t i = 0; i < na; i++) {
+        jl_datatype_t *tupt = (jl_datatype_t*)jl_typeof(tup);
+        for (size_t i = 0; i < nargs; i++) {
             jl_value_t *ft = jl_field_type(type, i);
-            jl_value_t *fi = jl_get_nth_field(tup, i);
-            if (!jl_isa(fi, ft))
-                jl_type_error("new", ft, fi);
+            jl_value_t *et = jl_field_type(tupt, i);
+            assert(jl_is_concrete_type(ft) && jl_is_concrete_type(et));
+            if (et != ft)
+                jl_type_error("new", ft, jl_get_nth_field(tup, i));
         }
         return type->instance;
     }
     if (type->layout == NULL)
         jl_type_error("new", (jl_value_t*)jl_datatype_type, (jl_value_t*)type);
     jl_value_t *jv = jl_gc_alloc(ptls, jl_datatype_size(type), type);
-    JL_GC_PUSH1(&jv);
-    for (size_t i = 0; i < na; i++) {
+    jl_value_t *fi = NULL;
+    JL_GC_PUSH2(&jv, &fi);
+    for (size_t i = 0; i < nargs; i++) {
         jl_value_t *ft = jl_field_type(type, i);
-        jl_value_t *fi = jl_get_nth_field(tup, i);
+        fi = jl_get_nth_field(tup, i);
         if (!jl_isa(fi, ft))
             jl_type_error("new", ft, fi);
         jl_set_nth_field(jv, i, fi);
     }
-    init_struct_tail(type, jv, na);
     JL_GC_POP();
     return jv;
 }

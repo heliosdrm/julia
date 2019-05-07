@@ -35,7 +35,7 @@ Expr
 
 `Expr` objects contain two parts:
 
-  * a `Symbol` identifying the kind of expression. A symbol is an [interned string](https://en.wikipedia.org/wiki/String_interning)
+  * a [`Symbol`](@ref) identifying the kind of expression. A symbol is an [interned string](https://en.wikipedia.org/wiki/String_interning)
     identifier (more discussion below).
 
 ```jldoctest prog
@@ -129,7 +129,7 @@ julia> Symbol(:var,'_',"sym")
 In the context of an expression, symbols are used to indicate access to variables; when an expression
 is evaluated, a symbol is replaced with the value bound to that symbol in the appropriate [scope](@ref scope-of-variables).
 
-Sometimes extra parentheses around the argument to `:` are needed to avoid ambiguity in parsing.:
+Sometimes extra parentheses around the argument to `:` are needed to avoid ambiguity in parsing:
 
 ```jldoctest
 julia> :(:)
@@ -308,7 +308,7 @@ The intuition behind this behavior is that `x` is evaluated once for each `$`:
 one `$` works similarly to `eval(:x)`, giving `x`'s value, while two `$`s do the
 equivalent of `eval(eval(:x))`.
 
-### QuoteNode
+### [QuoteNode](@id man-quote-node)
 
 The usual representation of a `quote` form in an AST is an [`Expr`](@ref) with head `:quote`:
 
@@ -328,9 +328,15 @@ Expr
 As we have seen, such expressions support interpolation with `$`.
 However, in some situations it is necessary to quote code *without* performing interpolation.
 This kind of quoting does not yet have syntax, but is represented internally
-as an object of type `QuoteNode`.
-The parser yields `QuoteNode`s for simple quoted items like symbols:
+as an object of type `QuoteNode`:
+```jldoctest interp1
+julia> eval(Meta.quot(Expr(:$, :(1+2))))
+3
 
+julia> eval(QuoteNode(Expr(:$, :(1+2))))
+:($(Expr(:$, :(1 + 2))))
+```
+The parser yields `QuoteNode`s for simple quoted items like symbols:
 ```jldoctest interp1
 julia> dump(Meta.parse(":x"))
 QuoteNode
@@ -613,7 +619,7 @@ The argument `__source__` provides information (in the form of a `LineNumberNode
 of the `@` sign from the macro invocation.
 This allows macros to include better error diagnostic information,
 and is commonly used by logging, string-parser macros, and docs, for example,
-as well as to implement the `@__LINE__`, `@__FILE__`, and `@__DIR__` macros.
+as well as to implement the [`@__LINE__`](@ref), [`@__FILE__`](@ref), and [`@__DIR__`](@ref) macros.
 
 The location information can be accessed by referencing `__source__.line` and `__source__.file`:
 
@@ -638,7 +644,7 @@ in the current module.
 
 ### Building an advanced macro
 
-Here is a simplified definition of Julia's `@assert` macro:
+Here is a simplified definition of Julia's [`@assert`](@ref) macro:
 
 ```jldoctest building
 julia> macro assert(ex)
@@ -667,7 +673,7 @@ This is equivalent to writing:
 That is, in the first call, the expression `:(1 == 1.0)` is spliced into the test condition slot,
 while the value of `string(:(1 == 1.0))` is spliced into the assertion message slot. The entire
 expression, thus constructed, is placed into the syntax tree where the `@assert` macro call occurs.
-Then at execution time, if the test expression evaluates to true, then `nothing` is returned,
+Then at execution time, if the test expression evaluates to true, then [`nothing`](@ref) is returned,
 whereas if the test is false, an error is raised indicating the asserted expression that was false.
 Notice that it would not be possible to write this as a function, since only the *value* of the
 condition is available and it would be impossible to display the expression that computed it in
@@ -675,7 +681,7 @@ the error message.
 
 The actual definition of `@assert` in Julia Base is more complicated. It allows the
 user to optionally specify their own error message, instead of just printing the failed expression.
-Just like in functions with a variable number of arguments, this is specified with an ellipses
+Just like in functions with a variable number of arguments ([Varargs Functions](@ref)), this is specified with an ellipses
 following the last argument:
 
 ```jldoctest assert2
@@ -1094,7 +1100,7 @@ When defining generated functions, there are four main differences to ordinary f
 3. Instead of calculating something or performing some action, you return a *quoted expression* which,
    when evaluated, does what you want.
 4. Generated functions must not *mutate* or *observe* any non-constant global state (including,
-   for example, IO, locks, non-local dictionaries, or using `hasmethod`).
+   for example, IO, locks, non-local dictionaries, or using [`hasmethod`](@ref)).
    This means they can only read global constants, and cannot have any side effects.
    In other words, they must be completely pure.
    Due to an implementation limitation, this also means that they currently cannot define a closure

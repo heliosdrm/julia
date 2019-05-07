@@ -236,7 +236,7 @@ typedef struct _varidx {
     struct _varidx *prev;
 } jl_varidx_t;
 
-static uintptr_t jl_object_id_(jl_value_t *tv, jl_value_t *v) JL_NOTSAFEPOINT;
+JL_DLLEXPORT uintptr_t jl_object_id_(jl_value_t *tv, jl_value_t *v) JL_NOTSAFEPOINT;
 
 static uintptr_t type_object_id_(jl_value_t *v, jl_varidx_t *env) JL_NOTSAFEPOINT
 {
@@ -277,7 +277,7 @@ static uintptr_t type_object_id_(jl_value_t *v, jl_varidx_t *env) JL_NOTSAFEPOIN
     return jl_object_id_((jl_value_t*)tv, v);
 }
 
-static uintptr_t jl_object_id_(jl_value_t *tv, jl_value_t *v) JL_NOTSAFEPOINT
+JL_DLLEXPORT uintptr_t jl_object_id_(jl_value_t *tv, jl_value_t *v) JL_NOTSAFEPOINT
 {
     if (tv == (jl_value_t*)jl_sym_type)
         return ((jl_sym_t*)v)->hash;
@@ -445,13 +445,41 @@ JL_CALLABLE(jl_f_ifelse)
 
 // apply ----------------------------------------------------------------------
 
-jl_function_t *jl_append_any_func;
+static NOINLINE jl_svec_t *_copy_to(size_t newalloc, jl_value_t **oldargs, size_t oldalloc)
+{
+    size_t j;
+    jl_svec_t *newheap = jl_alloc_svec_uninit(newalloc);
+    jl_value_t **newargs = jl_svec_data(newheap);
+    for (j = 0; j < oldalloc; j++)
+        newargs[j] = oldargs[j];
+    for (; j < newalloc; j++)
+        newargs[j] = NULL;
+    return newheap;
+}
+
+void STATIC_INLINE _grow_to(jl_value_t **root, jl_value_t ***oldargs, jl_svec_t **arg_heap, size_t *n_alloc, size_t newalloc, size_t extra)
+{
+    size_t oldalloc = *n_alloc;
+    if (oldalloc >= newalloc)
+        return;
+    if (extra)
+        // grow by an extra 50% if newalloc is still only a guess
+        newalloc += oldalloc / 2 + 16;
+    jl_svec_t *newheap = _copy_to(newalloc, *oldargs, oldalloc);
+    *root = (jl_value_t*)newheap;
+    *arg_heap = newheap;
+    *oldargs = jl_svec_data(newheap);
+    *n_alloc = newalloc;
+}
+
+static jl_function_t *jl_iterate_func;
 
 JL_CALLABLE(jl_f__apply)
 {
     JL_NARGSV(apply, 1);
     jl_function_t *f = args[0];
     if (nargs == 2) {
+        // some common simple cases
         if (f == jl_builtin_svec) {
             if (jl_is_svec(args[1]))
                 return args[1];
@@ -459,7 +487,7 @@ JL_CALLABLE(jl_f__apply)
                 size_t n = jl_array_len(args[1]);
                 jl_svec_t *t = jl_alloc_svec(n);
                 JL_GC_PUSH1(&t);
-                for(size_t i=0; i < n; i++) {
+                for (size_t i = 0; i < n; i++) {
                     jl_svecset(t, i, jl_arrayref((jl_array_t*)args[1], i));
                 }
                 JL_GC_POP();
@@ -470,85 +498,93 @@ JL_CALLABLE(jl_f__apply)
             return args[1];
         }
     }
-    size_t n=0, i, j;
-    for(i=1; i < nargs; i++) {
+    // estimate how many real arguments we appear to have
+    size_t precount = 1;
+    size_t extra = 0;
+    size_t i;
+    for (i = 1; i < nargs; i++) {
         if (jl_is_svec(args[i])) {
-            n += jl_svec_len(args[i]);
+            precount += jl_svec_len(args[i]);
         }
         else if (jl_is_tuple(args[i]) || jl_is_namedtuple(args[i])) {
-            n += jl_nfields(args[i]);
+            precount += jl_nfields(args[i]);
         }
         else if (jl_is_array(args[i])) {
-            n += jl_array_len(args[i]);
+            precount += jl_array_len(args[i]);
         }
         else {
-            if (jl_append_any_func == NULL) {
-                jl_append_any_func =
-                    (jl_function_t*)jl_get_global(jl_top_module, jl_symbol("append_any"));
-                if (jl_append_any_func == NULL) {
-                    // error if append_any not available
-                    JL_TYPECHK(apply, tuple, jl_typeof(args[i]));
-                }
-            }
-            jl_array_t *argarr = NULL;
-            JL_GC_PUSH2(&argarr, &f);
-            args[0] = jl_append_any_func;
-            argarr = (jl_array_t*)jl_apply(args, nargs);
-            assert(jl_typeis(argarr, jl_array_any_type));
-            jl_array_grow_beg(argarr, 1);
-            jl_array_ptr_set(argarr, 0, f);
-            args[0] = f;
-            jl_value_t *result = jl_apply(jl_array_ptr_data(argarr), jl_array_len(argarr));
-            JL_GC_POP();
-            return result;
+            extra += 1;
         }
     }
-    jl_value_t **newargs;
-    n++;
-    int onstack = (n < jl_page_size/sizeof(jl_value_t*));
-    JL_GC_PUSHARGS(newargs, onstack ? n : 1);
-    jl_svec_t *arg_heap = NULL;
-    if (!onstack) {
-        // put arguments on the heap if there are too many
-        arg_heap = jl_alloc_svec(n);
-        newargs[0] = (jl_value_t*)arg_heap;
-        newargs = jl_svec_data(arg_heap);
+    if (extra && jl_iterate_func == NULL) {
+        jl_iterate_func = jl_get_function(jl_top_module, "iterate");
+        if (jl_iterate_func == NULL)
+            jl_undefined_var_error(jl_symbol("iterate"));
     }
-    // GC Note: here we assume that the return value of `jl_svecref`,
-    //          `jl_array_ptr_ref` will not be young if `arg_heap` becomes old
-    //          since they are allocated before `arg_heap`. Otherwise,
-    //          we need to add write barrier for !onstack
+    // allocate space for the argument array and gc roots for it
+    // based on our previous estimates
+    // use the stack if we have a good estimate that it is small
+    // otherwise, use the heap and grow it incrementally
+    // and if there are any extra elements, we'll also need a couple extra roots
+    int onstack = (precount + 32 * extra < jl_page_size / sizeof(jl_value_t*));
+    size_t stackalloc = onstack ? (precount + 4 * extra + (extra ? 16 : 0)) : 1;
+    size_t n_alloc;
+    jl_value_t **roots;
+    JL_GC_PUSHARGS(roots, stackalloc + (extra ? 2 : 0));
+    jl_value_t **newargs = NULL;
+    jl_svec_t *arg_heap = NULL;
+    if (onstack) {
+        newargs = roots;
+        n_alloc = stackalloc;
+    }
+    else {
+        // put arguments on the heap if there are too many
+        n_alloc = 0;
+        _grow_to(&roots[0], &newargs, &arg_heap, &n_alloc, precount, extra);
+    }
     newargs[0] = f;
-    n = 1;
-    for(i=1; i < nargs; i++) {
+    precount -= 1;
+    size_t n = 1;
+    for (i = 1; i < nargs; i++) {
         jl_value_t *ai = args[i];
         if (jl_is_svec(ai)) {
             jl_svec_t *t = (jl_svec_t*)ai;
-            size_t al = jl_svec_len(t);
-            for(j=0; j < al; j++)
+            size_t j, al = jl_svec_len(t);
+            precount = (precount > al) ? precount - al : 0;
+            _grow_to(&roots[0], &newargs, &arg_heap, &n_alloc, n + precount + al, extra);
+            for (j = 0; j < al; j++) {
                 newargs[n++] = jl_svecref(t, j);
+                // GC Note: here we assume that the return value of `jl_svecref`
+                //          will not be young if `arg_heap` becomes old
+                //          since they are allocated before `arg_heap`. Otherwise,
+                //          we need to add write barrier for !onstack
+            }
         }
         else if (jl_is_tuple(ai) || jl_is_namedtuple(ai)) {
-            size_t al = jl_nfields(ai);
-            for(j=0; j < al; j++) {
+            size_t j, al = jl_nfields(ai);
+            precount = (precount > al) ? precount - al : 0;
+            _grow_to(&roots[0], &newargs, &arg_heap, &n_alloc, n + precount + al, extra);
+            for (j = 0; j < al; j++) {
                 // jl_fieldref may allocate.
                 newargs[n++] = jl_fieldref(ai, j);
                 if (arg_heap)
                     jl_gc_wb(arg_heap, newargs[n - 1]);
             }
         }
-        else {
-            assert(jl_is_array(ai));
+        else if (jl_is_array(ai)) {
             jl_array_t *aai = (jl_array_t*)ai;
-            size_t al = jl_array_len(aai);
+            size_t j, al = jl_array_len(aai);
+            precount = (precount > al) ? precount - al : 0;
+            _grow_to(&roots[0], &newargs, &arg_heap, &n_alloc, n + precount + al, extra);
             if (aai->flags.ptrarray) {
                 for (j = 0; j < al; j++) {
                     jl_value_t *arg = jl_array_ptr_ref(aai, j);
-                    // apply with array splatting may have embedded NULL value
-                    // #11772
+                    // apply with array splatting may have embedded NULL value (#11772)
                     if (__unlikely(arg == NULL))
                         jl_throw(jl_undefref_exception);
                     newargs[n++] = arg;
+                    if (arg_heap)
+                        jl_gc_wb(arg_heap, arg);
                 }
             }
             else {
@@ -559,6 +595,33 @@ JL_CALLABLE(jl_f__apply)
                 }
             }
         }
+        else {
+            assert(extra > 0);
+            jl_value_t *args[3];
+            args[0] = jl_iterate_func;
+            args[1] = ai;
+            jl_value_t *next = jl_apply(args, 2);
+            while (next != jl_nothing) {
+                roots[stackalloc] = next;
+                jl_value_t *value = jl_fieldref(next, 0);
+                roots[stackalloc + 1] = next;
+                jl_value_t *state = jl_fieldref(next, 1);
+                roots[stackalloc] = state;
+                _grow_to(&roots[0], &newargs, &arg_heap, &n_alloc, n + precount + 1, extra);
+                newargs[n++] = value;
+                if (arg_heap)
+                    jl_gc_wb(arg_heap, value);
+                roots[stackalloc + 1] = NULL;
+                args[2] = state;
+                next = jl_apply(args, 3);
+            }
+            roots[stackalloc] = NULL;
+            extra -= 1;
+        }
+    }
+    if (arg_heap) {
+        // optimization: keep only the first root, free the others
+        ((void**)roots)[-2] = (void*)(((size_t)1) << 1);
     }
     jl_value_t *result = jl_apply(newargs, n);
     JL_GC_POP();
@@ -752,7 +815,8 @@ static jl_value_t *get_fieldtype(jl_value_t *t, jl_value_t *f, int dothrow)
                 return (jl_value_t*)jl_any_type;
             return get_fieldtype(tt, f, dothrow);
         }
-        int nf = jl_field_count(st);
+        jl_svec_t *types = jl_get_fieldtypes(st);
+        int nf = jl_svec_len(types);
         if (nf > 0 && field_index >= nf-1 && st->name == jl_tuple_typename) {
             jl_value_t *ft = jl_field_type(st, nf-1);
             if (jl_is_vararg_type(ft))
@@ -790,8 +854,8 @@ JL_CALLABLE(jl_f_fieldtype)
 JL_CALLABLE(jl_f_nfields)
 {
     JL_NARGS(nfields, 1, 1);
-    jl_value_t *x = args[0];
-    return jl_box_long(jl_field_count(jl_typeof(x)));
+    jl_datatype_t *xt = (jl_datatype_t*)jl_typeof(args[0]);
+    return jl_box_long(jl_datatype_nfields(xt));
 }
 
 JL_CALLABLE(jl_f_isdefined)
@@ -1059,6 +1123,11 @@ JL_CALLABLE(jl_f_arrayref)
     return jl_arrayref(a, i);
 }
 
+JL_CALLABLE(jl_f_const_arrayref)
+{
+    return jl_f_arrayref(F, args, nargs);
+}
+
 JL_CALLABLE(jl_f_arrayset)
 {
     JL_NARGSV(arrayset, 4);
@@ -1181,7 +1250,7 @@ static void add_builtin(const char *name, jl_value_t *v)
 jl_fptr_args_t jl_get_builtin_fptr(jl_value_t *b)
 {
     assert(jl_isa(b, (jl_value_t*)jl_builtin_type));
-    return ((jl_typemap_entry_t*)jl_gf_mtable(b)->cache)->func.linfo->specptr.fptr1;
+    return ((jl_typemap_entry_t*)jl_gf_mtable(b)->cache)->func.linfo->cache->specptr.fptr1;
 }
 
 static void add_builtin_func(const char *name, jl_fptr_args_t fptr)
@@ -1210,6 +1279,7 @@ void jl_init_primitives(void) JL_GC_DISABLED
 
     // array primitives
     add_builtin_func("arrayref", jl_f_arrayref);
+    add_builtin_func("const_arrayref", jl_f_arrayref);
     add_builtin_func("arrayset", jl_f_arrayset);
     add_builtin_func("arraysize", jl_f_arraysize);
 
@@ -1250,6 +1320,7 @@ void jl_init_primitives(void) JL_GC_DISABLED
     add_builtin("Module", (jl_value_t*)jl_module_type);
     add_builtin("MethodTable", (jl_value_t*)jl_methtable_type);
     add_builtin("Method", (jl_value_t*)jl_method_type);
+    add_builtin("CodeInstance", (jl_value_t*)jl_code_instance_type);
     add_builtin("TypeMapEntry", (jl_value_t*)jl_typemap_entry_type);
     add_builtin("TypeMapLevel", (jl_value_t*)jl_typemap_level_type);
     add_builtin("Symbol", (jl_value_t*)jl_sym_type);

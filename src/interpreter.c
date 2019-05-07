@@ -47,11 +47,11 @@ SECT_INTERP static int equiv_type(jl_datatype_t *dta, jl_datatype_t *dtb)
           dta->ninitialized == dtb->ninitialized &&
           jl_egal((jl_value_t*)jl_field_names(dta), (jl_value_t*)jl_field_names(dtb)) &&
           jl_nparams(dta) == jl_nparams(dtb) &&
-          jl_field_count(dta) == jl_field_count(dtb)))
+          jl_svec_len(dta->types) == jl_svec_len(dtb->types)))
         return 0;
     jl_value_t *a=NULL, *b=NULL;
     int ok = 1;
-    size_t i, nf = jl_field_count(dta);
+    size_t i, nf = jl_svec_len(dta->types);
     JL_GC_PUSH2(&a, &b);
     a = jl_rewrap_unionall((jl_value_t*)dta->super, dta->name->wrapper);
     b = jl_rewrap_unionall((jl_value_t*)dtb->super, dtb->name->wrapper);
@@ -63,7 +63,8 @@ SECT_INTERP static int equiv_type(jl_datatype_t *dta, jl_datatype_t *dtb)
     JL_CATCH {
         ok = 0;
     }
-    if (!ok) goto no;
+    if (!ok)
+        goto no;
     assert(jl_is_datatype(a));
     a = dta->name->wrapper;
     b = dtb->name->wrapper;
@@ -77,9 +78,11 @@ SECT_INTERP static int equiv_type(jl_datatype_t *dta, jl_datatype_t *dtb)
         b = ub->body;
     }
     assert(jl_is_datatype(a) && jl_is_datatype(b));
-    for (i=0; i < nf; i++) {
-        jl_value_t *ta = jl_svecref(((jl_datatype_t*)a)->types, i);
-        jl_value_t *tb = jl_svecref(((jl_datatype_t*)b)->types, i);
+    a = (jl_value_t*)jl_get_fieldtypes((jl_datatype_t*)a);
+    b = (jl_value_t*)jl_get_fieldtypes((jl_datatype_t*)b);
+    for (i = 0; i < nf; i++) {
+        jl_value_t *ta = jl_svecref(a, i);
+        jl_value_t *tb = jl_svecref(b, i);
         if (jl_has_free_typevars(ta)) {
             if (!jl_has_free_typevars(tb) || !jl_egal(ta, tb))
                 goto no;
@@ -318,7 +321,7 @@ SECT_INTERP static jl_value_t *do_call(jl_value_t **args, size_t nargs, interpre
     jl_value_t **argv;
     JL_GC_PUSHARGS(argv, nargs);
     size_t i;
-    for(i=0; i < nargs; i++)
+    for (i = 0; i < nargs; i++)
         argv[i] = eval_value(args[i], s);
     jl_value_t *result = jl_apply_generic(argv, nargs);
     JL_GC_POP();
@@ -334,7 +337,7 @@ SECT_INTERP static jl_value_t *do_invoke(jl_value_t **args, size_t nargs, interp
         argv[i - 1] = eval_value(args[i], s);
     jl_method_instance_t *meth = (jl_method_instance_t*)args[0];
     assert(jl_is_method_instance(meth));
-    jl_value_t *result = meth->invoke(meth, argv, nargs - 1);
+    jl_value_t *result = jl_invoke(meth, argv, nargs - 1);
     JL_GC_POP();
     return result;
 }
@@ -498,7 +501,7 @@ SECT_INTERP static jl_value_t *eval_value(jl_value_t *e, interpreter_state *s)
     else if (head == boundscheck_sym) {
         return jl_true;
     }
-    else if (head == meta_sym || head == inbounds_sym || head == simdloop_sym) {
+    else if (head == meta_sym || head == inbounds_sym || head == loopinfo_sym) {
         return jl_nothing;
     }
     else if (head == gc_preserve_begin_sym || head == gc_preserve_end_sym) {
@@ -778,35 +781,37 @@ SECT_INTERP static jl_value_t *eval_body(jl_array_t *stmts, interpreter_state *s
 
 // preparing method IR for interpreter
 
-jl_code_info_t *jl_code_for_interpreter(jl_method_instance_t *lam)
+jl_code_info_t *jl_code_for_interpreter(jl_method_instance_t *mi)
 {
-    jl_code_info_t *src = (jl_code_info_t*)lam->inferred;
-    JL_GC_PUSH1(&src);
-    if (jl_is_method(lam->def.method)) {
+    jl_code_info_t *src = (jl_code_info_t*)mi->uninferred;
+    if (jl_is_method(mi->def.value)) {
         if (!src || (jl_value_t*)src == jl_nothing) {
-            if (lam->def.method->source) {
-                src = (jl_code_info_t*)lam->def.method->source;
+            if (mi->def.method->source) {
+                src = (jl_code_info_t*)mi->def.method->source;
             }
             else {
-                assert(lam->def.method->generator);
-                src = jl_code_for_staged(lam);
+                assert(mi->def.method->generator);
+                src = jl_code_for_staged(mi);
             }
         }
         if (src && (jl_value_t*)src != jl_nothing) {
-            src = jl_uncompress_ast(lam->def.method, (jl_array_t*)src);
+            JL_GC_PUSH1(&src);
+            src = jl_uncompress_ast(mi->def.method, NULL, (jl_array_t*)src);
+            mi->uninferred = (jl_value_t*)src;
+            jl_gc_wb(mi, src);
+            JL_GC_POP();
         }
     }
     if (!src || !jl_is_code_info(src)) {
         jl_error("source missing for method called in interpreter");
     }
-    JL_GC_POP();
     return src;
 }
 
 // interpreter entry points
 
 struct jl_interpret_call_args {
-    jl_method_instance_t *lam;
+    jl_method_instance_t *mi;
     jl_value_t **args;
     uint32_t nargs;
 };
@@ -816,9 +821,7 @@ SECT_INTERP CALLBACK_ABI void *jl_interpret_call_callback(interpreter_state *s, 
     struct jl_interpret_call_args *args =
         (struct jl_interpret_call_args *)vargs;
     JL_GC_PROMISE_ROOTED(args);
-    jl_code_info_t *src = jl_code_for_interpreter(args->lam);
-    args->lam->inferred = (jl_value_t*)src;
-    jl_gc_wb(args->lam, src);
+    jl_code_info_t *src = jl_code_for_interpreter(args->mi);
 
     jl_array_t *stmts = src->code;
     assert(jl_typeis(stmts, jl_array_any_type));
@@ -829,21 +832,21 @@ SECT_INTERP CALLBACK_ABI void *jl_interpret_call_callback(interpreter_state *s, 
     s->src = src;
     size_t nargs;
     int isva;
-    if (jl_is_module(args->lam->def.value)) {
-        s->module = args->lam->def.module;
+    if (jl_is_module(args->mi->def.value)) {
+        s->module = args->mi->def.module;
         nargs = 0;
         isva = 0;
     }
     else {
-        s->module = args->lam->def.method->module;
-        nargs = args->lam->def.method->nargs;
-        isva = args->lam->def.method->isva;
+        s->module = args->mi->def.method->module;
+        nargs = args->mi->def.method->nargs;
+        isva = args->mi->def.method->isva;
     }
     s->locals = locals + 2;
-    s->sparam_vals = args->lam->sparam_vals;
+    s->sparam_vals = args->mi->sparam_vals;
     s->preevaluation = 0;
     s->continue_at = 0;
-    s->mi = args->lam;
+    s->mi = args->mi;
     size_t i;
     for (i = 0; i < nargs; i++) {
         if (isva && i == nargs - 1)
@@ -856,9 +859,9 @@ SECT_INTERP CALLBACK_ABI void *jl_interpret_call_callback(interpreter_state *s, 
     return (void*)r;
 }
 
-SECT_INTERP jl_value_t *jl_fptr_interpret_call(jl_method_instance_t *lam, jl_value_t **args, uint32_t nargs)
+SECT_INTERP jl_value_t *jl_fptr_interpret_call(jl_code_instance_t *codeinst, jl_value_t **args, uint32_t nargs)
 {
-    struct jl_interpret_call_args callback_args = { lam, args, nargs };
+    struct jl_interpret_call_args callback_args = { codeinst->def, args, nargs };
     return (jl_value_t*)enter_interpreter_frame(jl_interpret_call_callback, (void *)&callback_args);
 }
 

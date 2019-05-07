@@ -245,6 +245,8 @@ isconst(m::Module, s::Symbol) =
 
 Tests whether variable `s` is defined in the current scope.
 
+See also [`isdefined`](@ref).
+
 # Examples
 ```jldoctest
 julia> function f()
@@ -310,6 +312,8 @@ Get a hash value for `x` based on object identity. `objectid(x)==objectid(y)` if
 objectid(@nospecialize(x)) = ccall(:jl_object_id, UInt, (Any,), x)
 
 # concrete datatype predicates
+
+datatype_fieldtypes(x::DataType) = ccall(:jl_get_fieldtypes, Any, (Any,), x)
 
 struct DataTypeLayout
     nfields::UInt32
@@ -405,7 +409,8 @@ function isstructtype(@nospecialize(t::Type))
     t = unwrap_unionall(t)
     # TODO: what to do for `Union`?
     isa(t, DataType) || return false
-    return length(t.types) != 0 || (t.size == 0 && !t.abstract)
+    hasfield = !isdefined(t, :types) || !isempty(t.types)
+    return hasfield || (t.size == 0 && !t.abstract)
 end
 
 """
@@ -419,7 +424,8 @@ function isprimitivetype(@nospecialize(t::Type))
     t = unwrap_unionall(t)
     # TODO: what to do for `Union`?
     isa(t, DataType) || return false
-    return length(t.types) == 0 && t.size != 0 && !t.abstract
+    hasfield = !isdefined(t, :types) || !isempty(t.types)
+    return !hasfield && t.size != 0 && !t.abstract
 end
 
 """
@@ -672,7 +678,10 @@ function fieldcount(@nospecialize t)
     if abstr
         throw(ArgumentError("type does not have a definite number of fields"))
     end
-    return length(t.types)
+    if isdefined(t, :types)
+        return length(t.types)
+    end
+    return length(t.name.names)
 end
 
 """
@@ -709,7 +718,7 @@ enumerated types (see `@enum`).
 julia> @enum Color red blue green
 
 julia> instances(Color)
-(red::Color = 0, blue::Color = 1, green::Color = 2)
+(red, blue, green)
 ```
 """
 function instances end
@@ -768,15 +777,15 @@ function code_lowered(@nospecialize(f), @nospecialize(t=Tuple); generated::Bool=
     end
     return map(method_instances(f, t)) do m
         if generated && isgenerated(m)
-            if isa(m, Core.MethodInstance)
-                return Core.Compiler.get_staged(m)
-            else # isa(m, Method)
+            if may_invoke_generator(m)
+                return ccall(:jl_code_for_staged, Any, (Any,), m)::CodeInfo
+            else
                 error("Could not expand generator for `@generated` method ", m, ". ",
                       "This can happen if the provided argument types (", t, ") are ",
                       "not leaf types, but the `generated` argument is `true`.")
             end
         end
-        code = uncompressed_ast(m)
+        code = uncompressed_ast(m.def::Method)
         debuginfo == :none && remove_linenums!(code)
         return code
     end
@@ -896,20 +905,20 @@ function length(mt::Core.MethodTable)
 end
 isempty(mt::Core.MethodTable) = (mt.defs === nothing)
 
-uncompressed_ast(m::Method) = isdefined(m, :source) ? uncompressed_ast(m, m.source) :
+uncompressed_ast(m::Method) = isdefined(m, :source) ? _uncompressed_ast(m, m.source) :
                               isdefined(m, :generator) ? error("Method is @generated; try `code_lowered` instead.") :
                               error("Code for this Method is not available.")
-uncompressed_ast(m::Method, s::CodeInfo) = copy(s)
-uncompressed_ast(m::Method, s::Array{UInt8,1}) = ccall(:jl_uncompress_ast, Any, (Any, Any), m, s)::CodeInfo
-uncompressed_ast(m::Core.MethodInstance) = uncompressed_ast(m.def)
+_uncompressed_ast(m::Method, s::CodeInfo) = copy(s)
+_uncompressed_ast(m::Method, s::Array{UInt8,1}) = ccall(:jl_uncompress_ast, Any, (Any, Ptr{Cvoid}, Any), m, C_NULL, s)::CodeInfo
+_uncompressed_ast(ci::Core.CodeInstance, s::Array{UInt8,1}) = ccall(:jl_uncompress_ast, Any, (Any, Any, Any), ci.def.def::Method, ci, s)::CodeInfo
 
 function method_instances(@nospecialize(f), @nospecialize(t), world::UInt = typemax(UInt))
     tt = signature_type(f, t)
-    results = Vector{Union{Method,Core.MethodInstance}}()
+    results = Core.MethodInstance[]
     for method_data in _methods_by_ftype(tt, -1, world)
         mtypes, msp, m = method_data
-        instance = Core.Compiler.code_for_method(m, mtypes, msp, world, false)
-        push!(results, ifelse(isa(instance, Core.MethodInstance), instance, m))
+        instance = ccall(:jl_specializations_get_linfo, Ref{MethodInstance}, (Any, Any, Any), m, mtypes, msp)
+        push!(results, instance)
     end
     return results
 end
@@ -941,14 +950,85 @@ struct CodegenParams
             emit_function, emitted_function)
 end
 
+const SLOT_USED = 0x8
+ast_slotflag(@nospecialize(code), i) = ccall(:jl_ast_slotflag, UInt8, (Any, Csize_t), code, i - 1)
+
+"""
+    may_invoke_generator(method, atypes, sparams)
+
+Computes whether or not we may invoke the generator for the given `method` on
+the given atypes and sparams. For correctness, all generated function are
+required to return monotonic answers. However, since we don't expect users to
+be able to successfully implement this criterion, we only call generated
+functions on concrete types. The one exception to this is that we allow calling
+generators with abstract types if the generator does not use said abstract type
+(and thus cannot incorrectly use it to break monotonicity). This function
+computes whether we are in either of these cases.
+
+Unlike normal functions, the compilation heuristics still can't generate good dispatch
+in some cases, but this may still allow inference not to fall over in some limited cases.
+"""
+function may_invoke_generator(method::MethodInstance)
+    return may_invoke_generator(method.def::Method, method.specTypes, method.sparam_vals)
+end
+function may_invoke_generator(method::Method, @nospecialize(atypes), sparams::SimpleVector)
+    # If we have complete information, we may always call the generator
+    isdispatchtuple(atypes) && return true
+
+    # We don't have complete information, but it is possible that the generator
+    # syntactically doesn't make use of the information we don't have. Check
+    # for that.
+
+    # For now, only handle the (common, generated by the frontend case) that the
+    # generator only has one method
+    isa(method.generator, Core.GeneratedFunctionStub) || return false
+    gen_mthds = methods(method.generator.gen)
+    length(gen_mthds) == 1 || return false
+
+    generator_method = first(gen_mthds)
+    nsparams = length(sparams)
+    isdefined(generator_method, :source) || return false
+    code = generator_method.source
+    nslots = ccall(:jl_ast_nslots, Int, (Any,), code)
+    at = unwrap_unionall(atypes)
+    (nslots >= 1 + length(sparams) + length(at.parameters)) || return false
+
+    for i = 1:nsparams
+        if isa(sparams[i], TypeVar)
+            if (ast_slotflag(code, 1 + i) & SLOT_USED) != 0
+                return false
+            end
+        end
+    end
+    for i = 1:length(at.parameters)
+        if !isdispatchelem(at.parameters[i])
+            if (ast_slotflag(code, 1 + i + nsparams) & SLOT_USED) != 0
+                return false
+            end
+        end
+    end
+    return true
+end
+
 # give a decent error message if we try to instantiate a staged function on non-leaf types
-function func_for_method_checked(m::Method, @nospecialize types)
+function func_for_method_checked(m::Method, @nospecialize(types), sparams::SimpleVector)
+    if isdefined(m, :generator) && !may_invoke_generator(m, types, sparams)
+        error("cannot call @generated function `", m, "` ",
+              "with abstract argument types: ", types)
+    end
+    return m
+end
+
+function func_for_method_checked(m::Method, @nospecialize(types))
+    depwarn("The two argument form of `func_for_method_checked` is deprecated. Pass sparams in addition.",
+            :func_for_method_checked)
     if isdefined(m, :generator) && !isdispatchtuple(types)
         error("cannot call @generated function `", m, "` ",
               "with abstract argument types: ", types)
     end
     return m
 end
+
 
 """
     code_typed(f, types; optimize=true, debuginfo=:default)
@@ -960,8 +1040,9 @@ The keyword `debuginfo` controls the amount of code metadata present in the outp
 possible options are `:source` or `:none`.
 """
 function code_typed(@nospecialize(f), @nospecialize(types=Tuple);
-                    optimize=true, debuginfo::Symbol=:default,
-                    world = ccall(:jl_get_world_counter, UInt, ()),
+                    optimize=true,
+                    debuginfo::Symbol=:default,
+                    world = get_world_counter(),
                     params = Core.Compiler.Params(world))
     ccall(:jl_is_in_pure_context, Bool, ()) && error("code reflection cannot be used from generated functions")
     if isa(f, Core.Builtin)
@@ -978,7 +1059,7 @@ function code_typed(@nospecialize(f), @nospecialize(types=Tuple);
     types = to_tuple_type(types)
     asts = []
     for x in _methods(f, types, -1, world)
-        meth = func_for_method_checked(x[3], types)
+        meth = func_for_method_checked(x[3], types, x[2])
         (code, ty) = Core.Compiler.typeinf_code(meth, x[1], x[2], optimize, params)
         code === nothing && error("inference not successful") # inference disabled?
         debuginfo == :none && remove_linenums!(code)
@@ -994,10 +1075,10 @@ function return_types(@nospecialize(f), @nospecialize(types=Tuple))
     end
     types = to_tuple_type(types)
     rt = []
-    world = ccall(:jl_get_world_counter, UInt, ())
+    world = get_world_counter()
     params = Core.Compiler.Params(world)
     for x in _methods(f, types, -1, world)
-        meth = func_for_method_checked(x[3], types)
+        meth = func_for_method_checked(x[3], types, x[2])
         ty = Core.Compiler.typeinf_type(meth, x[1], x[2], params)
         ty === nothing && error("inference not successful") # inference disabled?
         push!(rt, ty)
@@ -1137,22 +1218,22 @@ julia> hasmethod(g, Tuple{}, (:a, :b, :c, :d))  # g accepts arbitrary kwargs
 true
 ```
 """
-function hasmethod(@nospecialize(f), @nospecialize(t); world = typemax(UInt))
+function hasmethod(@nospecialize(f), @nospecialize(t); world=typemax(UInt))
     t = to_tuple_type(t)
     t = signature_type(f, t)
-    return ccall(:jl_method_exists, Cint, (Any, Any, UInt), typeof(f).name.mt, t, world) != 0
+    return ccall(:jl_gf_invoke_lookup, Any, (Any, UInt), t, world) !== nothing
 end
 
 function hasmethod(@nospecialize(f), @nospecialize(t), kwnames::Tuple{Vararg{Symbol}}; world=typemax(UInt))
+    # TODO: this appears to be doing the wrong queries
     hasmethod(f, t, world=world) || return false
     isempty(kwnames) && return true
     m = which(f, t)
-    max_world(m) <= world || return false
     kws = kwarg_decl(m, Core.kwftype(typeof(f)))
     for kw in kws
         endswith(String(kw), "...") && return true
     end
-    issubset(kwnames, kws)
+    return issubset(kwnames, kws)
 end
 
 """
@@ -1235,10 +1316,12 @@ has_bottom_parameter(t::Union) = has_bottom_parameter(t.a) & has_bottom_paramete
 has_bottom_parameter(t::TypeVar) = t.ub == Bottom || has_bottom_parameter(t.ub)
 has_bottom_parameter(::Any) = false
 
-min_world(m::Method) = reinterpret(UInt, m.min_world)
-max_world(m::Method) = reinterpret(UInt, m.max_world)
-min_world(m::Core.MethodInstance) = reinterpret(UInt, m.min_world)
-max_world(m::Core.MethodInstance) = reinterpret(UInt, m.max_world)
+min_world(m::Core.CodeInstance) = reinterpret(UInt, m.min_world)
+max_world(m::Core.CodeInstance) = reinterpret(UInt, m.max_world)
+min_world(m::Core.CodeInfo) = reinterpret(UInt, m.min_world)
+max_world(m::Core.CodeInfo) = reinterpret(UInt, m.max_world)
+get_world_counter() = ccall(:jl_get_world_counter, UInt, ())
+
 
 """
     propertynames(x, private=false)
